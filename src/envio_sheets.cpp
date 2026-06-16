@@ -1,5 +1,7 @@
 
+
 #if MEU_ID == BASE_ID
+#include "secrets.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -9,10 +11,10 @@
 static bool enviarPost(WiFiClientSecure& client, const String& body, const char* op);
 
 // =====================  CONFIG  =====================
-static const char* WIFI_SSID     = "SEU_SSID";
-static const char* WIFI_PASSWORD = "SUA_SENHA";
-static const char* SCRIPT_URL    = "SUA_URL_GOOGLE_SCRIPT";
-static const char* TOKEN         = "SEU_TOKEN";
+static const char* WIFI_SSID     = WIFI_SSID_SECRET;
+static const char* WIFI_PASSWORD = WIFI_PASS_SECRET;
+static const char* SCRIPT_URL    = SCRIPT_URL_SECRET;
+static const char* TOKEN         = TOKEN_SECRET;
 
 static const uint32_t INTERVALO_ATUAL_MS    = 5UL  * 60UL * 1000UL;   // 5 min
 static const uint32_t INTERVALO_MEDIAS_MS   = 60UL * 60UL * 1000UL;   // 60 min
@@ -33,12 +35,17 @@ struct Acumulador {
 
 static Acumulador acumuladores[MAX_NOS] = {0};
 static portMUX_TYPE acumMux = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t xHttpMutex = NULL;
 
 // =====================  POST HELPER  =====================
 
 static bool enviarPost(WiFiClientSecure& client, const String& body, const char* op) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[Sheets/%s] WiFi off, pulando\n", op);
+    return false;
+  }
+  
+  if (xSemaphoreTake(xHttpMutex, pdMS_TO_TICKS(30000)) != pdTRUE){
     return false;
   }
 
@@ -66,6 +73,7 @@ static bool enviarPost(WiFiClientSecure& client, const String& body, const char*
     Serial.printf("[Sheets/%s] HTTP %d\n", op, code);
   }
   https.end();
+  xSemaphoreGive(xHttpMutex);
   return ok;
 }
 
@@ -166,6 +174,7 @@ static void taskMediasH(void* params) {
 
 // =====================  API PÚBLICA  =====================
 void iniciarSheets() {
+  xHttpMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(taskAtual,   "atual",  8192, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(taskMediasH, "medias", 8192, NULL, 1, NULL, 0);
   Serial.println("[Sheets] Tasks Atual (5min) e MediasH (60min) iniciadas");

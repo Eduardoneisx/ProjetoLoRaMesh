@@ -6,11 +6,11 @@
 // ===================== CONFIGURAÇÕES ========================
 #define TTL_INICIAL     3
 #define PIN_AUX         19
-#define RX_LORA         26
-#define TX_LORA         27
+#define RX_LORA         16
+#define TX_LORA         17
 
-#define BEACON_INTERVAL_BASE  20000    // 90 sec(quando for pra valer)
-#define SENSOR_INTERVAL_BASE  10000    // 60 sec por nó(quando for pra valer)
+#define BEACON_INTERVAL_BASE  90000    // 90 sec(quando for pra valer)
+#define SENSOR_INTERVAL_BASE  60000    // 60 sec por nó(quando for pra valer)
 #define PAYLOAD_SIZE          5
 #define ROUTETIMEOUT          (3 * BEACON_INTERVAL_BASE)
 
@@ -20,68 +20,65 @@
 #if MEU_ID != BASE_ID
 #define DHTP 25
 #define DHTT DHT22
-DHT dht(DHTP,DHTT);
-#define DUST_PIN 4
+static DHT dht(DHTP,DHTT);
 
-volatile unsigned long lowStart = 0;
-volatile unsigned long lowPulseOccupancy = 0;
-
-unsigned long sampleStart = 0;
 #endif
 
 // RSSI: limiar mínimo (dBm) pra aceitar atualização de rota
-#define RSSI_MIN_LEARN        -110
+#define RSSI_MIN_LEARN        -105
 
 // ===================== HASH CACHE DE DUPLICATAS ========================
 #define HASH_SIZE    64
 #define CACHE_TTL_MS 15000
 
-struct HashSlot {
-  uint8_t       src;
-  uint8_t       msgId;
-  bool          occupied;
-  unsigned long seenAt;
+class HashCache {
+public:
+  bool alreadySeen(uint8_t src, uint8_t msgId) {
+    uint8_t idx = hashFunc(src, msgId);
+    for (uint8_t i = 0; i < HASH_SIZE; i++) {
+      uint8_t probe = (idx + i) & (HASH_SIZE - 1);
+      if (!slots[probe].occupied) continue;
+      if (millis() - slots[probe].seenAt > CACHE_TTL_MS) {
+        slots[probe].occupied = false;
+        continue;
+      }
+      if (slots[probe].src == src && slots[probe].msgId == msgId) return true;
+    }
+    return false;
+  }
+
+  void add(uint8_t src, uint8_t msgId) {
+    uint8_t idx = hashFunc(src, msgId);
+    for (uint8_t i = 0; i < HASH_SIZE; i++) {
+      uint8_t probe = (idx + i) & (HASH_SIZE - 1);
+      if (!slots[probe].occupied || millis() - slots[probe].seenAt > CACHE_TTL_MS) {
+        slots[probe] = { src, msgId, true, millis() };
+        return;
+      }
+      if (slots[probe].src == src && slots[probe].msgId == msgId) {
+        slots[probe].seenAt = millis();
+        return;
+      }
+    }
+    memset(slots, 0, sizeof(slots));
+    slots[idx] = { src, msgId, true, millis() };
+  }
+
+private:
+  struct Slot {
+    uint8_t       src;
+    uint8_t       msgId;
+    bool          occupied;
+    unsigned long seenAt;
+  };
+  Slot    slots[HASH_SIZE];
+
+  uint8_t hashFunc(uint8_t src, uint8_t msgId) {
+    return (src * 31 + msgId) & (HASH_SIZE - 1);
+  }
 };
-HashSlot hashCache[HASH_SIZE];
 
-uint8_t hashFunc(uint8_t src, uint8_t msgId) {
-  return (src * 31 + msgId) & (HASH_SIZE - 1);
-}
-
-bool alreadySeen(uint8_t src, uint8_t msgId) {
-  uint8_t idx = hashFunc(src, msgId);
-  for (uint8_t i = 0; i < HASH_SIZE; i++) {
-    uint8_t probe = (idx + i) & (HASH_SIZE - 1);
-    if (!hashCache[probe].occupied) continue;
-    if (millis() - hashCache[probe].seenAt > CACHE_TTL_MS) {
-      hashCache[probe].occupied = false;
-      continue;
-    }
-    if (hashCache[probe].src == src && hashCache[probe].msgId == msgId) return true;
-  }
-  return false;
-}
-
-void addToCache(uint8_t src, uint8_t msgId) {
-  uint8_t idx = hashFunc(src, msgId);
-  for (uint8_t i = 0; i < HASH_SIZE; i++) {
-    uint8_t probe = (idx + i) & (HASH_SIZE - 1);
-    if (!hashCache[probe].occupied ||
-        millis() - hashCache[probe].seenAt > CACHE_TTL_MS) {
-      hashCache[probe].src      = src;
-      hashCache[probe].msgId    = msgId;
-      hashCache[probe].seenAt   = millis();
-      hashCache[probe].occupied = true;
-      return;
-    }
-    if (hashCache[probe].src == src && hashCache[probe].msgId == msgId) {
-      hashCache[probe].seenAt = millis();
-      return;
-    }
-  }
-  memset(hashCache, 0, sizeof(hashCache));
-  hashCache[idx] = { src, msgId, true, millis() };
-}
+static HashCache hashCache;
 
 // ===================== ESTRUTURA DA MENSAGEM ========================
 struct MeshMessage {
@@ -101,7 +98,7 @@ struct MeshMessage {
 #define MSG_TOTAL_RX_BYTES (sizeof(MeshMessage) + 1)
 
 // ===================== CRC =====================
-uint8_t calculaCrc(uint8_t* data, uint8_t length) {
+static uint8_t calculaCrc(uint8_t* data, uint8_t length) {
   uint8_t crc = 0x00;
   for (uint8_t i = 0; i < length; i++) {
     crc ^= data[i];
@@ -113,87 +110,95 @@ uint8_t calculaCrc(uint8_t* data, uint8_t length) {
   return crc;
 }
 
-uint8_t calculaCrcMsg(MeshMessage &msg) {
+static uint8_t calculaCrcMsg(MeshMessage &msg) {
   return calculaCrc((uint8_t*)&msg,
                     sizeof(msg) - sizeof(msg.checkSum));
 }
 
 // ===================== GLOBAIS ======================
-uint8_t           nextMsgId      = 1;
-unsigned long     nextBeaconTime = 0;
-unsigned long     nextSensorTime = 0;
-volatile uint8_t  hopsToBase     = 255;
-volatile unsigned long confirmRoute = 0;
-
-SemaphoreHandle_t xFwdMutex = NULL;  // protege fwdQueue
+static uint8_t           nextMsgId      = 1;
+static unsigned long     nextBeaconTime = 0;
+static unsigned long     nextSensorTime = 0;
+static volatile uint8_t  hopsToBase     = 255;
+static volatile unsigned long confirmRoute = 0;
 
 // ===================== PROTÓTIPOS ====================
-uint8_t       calculaCrcMsg(MeshMessage &msg);
-void          sendMessage(MeshMessage &msg);
-void          handleData(MeshMessage &msg, int rssi_dbm);
-void          processaSerial();
-uint8_t       getNextMsgId();
-unsigned long getJitteredInterval(unsigned long base);
+static uint8_t       calculaCrcMsg(MeshMessage &msg);
+static void          sendMessage(MeshMessage &msg);
+static void          handleData(MeshMessage &msg, int rssi_dbm);
+static void          processaSerial();
+static uint8_t       getNextMsgId();
+static unsigned long getJitteredInterval(unsigned long base);
 
 #if MEU_ID != BASE_ID
-void          enqueueFwd(MeshMessage &msg, unsigned long sendAt);
-void          processFwdQueue();
-void          handleBeacon(MeshMessage &msg, int rssi_dbm);
-void          sendDataToBase();
-void          checkRoute();
+static void          handleBeacon(MeshMessage &msg, int rssi_dbm);
+static void          sendDataToBase();
+static void          checkRoute();
 #endif
 
 #if MEU_ID == BASE_ID
-void          sendBeacon();
+static void          sendBeacon();
 #endif
 // ===================== FILA DE FWD =======================
 #if MEU_ID != BASE_ID
 
-#define FWD_QUEUE_SIZE 3 // tamanho da fila = 6
+#define FWD_QUEUE_SIZE 3
 
-struct PendingFwd {
-  MeshMessage   msg;
-  unsigned long sendAt;
-  bool          active;
+class FwdQueue {
+public:
+  bool init() {
+    mutex = xSemaphoreCreateMutex();
+    return mutex != NULL;
+  }
+
+  void enqueue(MeshMessage &msg, unsigned long sendAt) {
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    for (uint8_t i = 0; i < FWD_QUEUE_SIZE; i++) {
+      if (!queue[i].active) {
+        queue[i] = { msg, sendAt, true };
+        xSemaphoreGive(mutex);
+        return;
+      }
+    }
+    xSemaphoreGive(mutex);
+    Serial.println("Fila de fwd cheia, descartando");
+  }
+
+  void process() {
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    for (uint8_t i = 0; i < FWD_QUEUE_SIZE; i++) {
+      if (queue[i].active && (long)(millis() - queue[i].sendAt) >= 0) {
+        MeshMessage toSend = queue[i].msg;
+        queue[i].active = false;
+        xSemaphoreGive(mutex);
+        sendMessage(toSend);
+        return; // uma por vez para não segurar o mutex durante TX
+      }
+    }
+    xSemaphoreGive(mutex);
+  }
+
+private:
+  struct Entry {
+    MeshMessage   msg;
+    unsigned long sendAt;
+    bool          active;
+  };
+  Entry             queue[FWD_QUEUE_SIZE];
+  SemaphoreHandle_t mutex = NULL;
 };
-PendingFwd fwdQueue[FWD_QUEUE_SIZE];
 
-void enqueueFwd(MeshMessage &msg, unsigned long sendAt) {
-  if (xSemaphoreTake(xFwdMutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-  for (uint8_t i = 0; i < FWD_QUEUE_SIZE; i++) {
-    if (!fwdQueue[i].active) {
-      fwdQueue[i] = { msg, sendAt, true };
-      xSemaphoreGive(xFwdMutex);
-      return;
-    }
-  }
-  xSemaphoreGive(xFwdMutex);
-  Serial.println("Fila de fwd cheia, descartando");
-}
-
-void processFwdQueue() {
-  if (xSemaphoreTake(xFwdMutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-  for (uint8_t i = 0; i < FWD_QUEUE_SIZE; i++) {
-    if (fwdQueue[i].active && (long)(millis() - fwdQueue[i].sendAt) >= 0) {
-      MeshMessage toSend = fwdQueue[i].msg;
-      fwdQueue[i].active = false;
-      xSemaphoreGive(xFwdMutex);
-      sendMessage(toSend);
-      return; // uma por vez para não segurar o mutex durante TX
-    }
-  }
-  xSemaphoreGive(xFwdMutex);
-}
+static FwdQueue fwdQueue;
 #endif
 // ===================== FREERTOS TASKS =====================
-void taskRX(void* pvParams) {
+static void taskRX(void* pvParams) {
   for (;;) {
     processaSerial();
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
-void taskPeriodic(void* pvParams) {
+static void taskPeriodic(void* pvParams) {
   for (;;) {
     #if MEU_ID == BASE_ID
       if ((long)(millis() - nextBeaconTime) >= 0) {
@@ -206,7 +211,7 @@ void taskPeriodic(void* pvParams) {
         nextSensorTime = millis() + getJitteredInterval(SENSOR_INTERVAL_BASE);
       }
       checkRoute();
-      processFwdQueue();
+      fwdQueue.process();
     #endif
     vTaskDelay(pdMS_TO_TICKS(50));
   }
@@ -216,7 +221,7 @@ void taskPeriodic(void* pvParams) {
 void setup() {
   Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, RX_LORA, TX_LORA);
-  pinMode(PIN_AUX, INPUT);
+  pinMode(PIN_AUX, INPUT_PULLUP);
   
   #if MEU_ID != BASE_ID
   dht.begin();
@@ -231,8 +236,6 @@ void setup() {
   randomSeed(analogRead(0) ^ MEU_ID ^ esp_random());
   nextMsgId = (uint8_t)random(1, 256);
 
-  memset(hashCache, 0, sizeof(hashCache));
-
   Serial.printf("No %d iniciado. Base ID: %d\n", MEU_ID, BASE_ID);
 
   #if MEU_ID == BASE_ID
@@ -240,12 +243,10 @@ void setup() {
     Serial.println("Modo BASE ativado");
     nextBeaconTime = millis() + random(1000, 5000);
   #else
-    xFwdMutex = xSemaphoreCreateMutex();
-    if (xFwdMutex == NULL) {
+    if (!fwdQueue.init()) {
       Serial.println("FATAL: sem memoria para mutex");
       while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    memset(fwdQueue, 0, sizeof(fwdQueue));
     nextSensorTime = millis() + random(1000, SENSOR_INTERVAL_BASE);
     Serial.printf("Primeiro envio em %lu ms\n", nextSensorTime - millis());
   #endif
@@ -256,19 +257,18 @@ void setup() {
 }
 
 // ==================== LOOP ======================
-// Toda a lógica foi movida para taskRX e taskPeriodic.
 void loop() {
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
 // =================== JITTER ====================
-unsigned long getJitteredInterval(unsigned long base) {
+static unsigned long getJitteredInterval(unsigned long base) {
   long jitter = (long)(base / 3);              // ±33%
   return base + random(-jitter, jitter);
 }
 
 // ===================== RECEPÇÃO COM RSSI =====================
-void processaSerial() {
+static void processaSerial() {
   
   while (Serial2.available() > 0) {
     if (Serial2.peek() == START_BYTE) break;
@@ -279,7 +279,6 @@ void processaSerial() {
 
   vTaskDelay(pdMS_TO_TICKS(2));
   
-  //Serial.printf("[processaSerial] avail=%d, MSG_TOTAL=%d\n", avail, MSG_TOTAL_RX_BYTES);
 
   MeshMessage msg;
   Serial2.readBytes((uint8_t*)&msg, sizeof(MeshMessage));
@@ -293,11 +292,11 @@ void processaSerial() {
     Serial.println("  -> CRC FAIL");
     return;
   }
-  if (alreadySeen(msg.src, msg.msgId)) {
+  if (hashCache.alreadySeen(msg.src, msg.msgId)) {
     Serial.println("  -> JA VISTO, descartando");
     return;
   }
-  addToCache(msg.src, msg.msgId);
+  hashCache.add(msg.src, msg.msgId);
 
   switch (msg.type) {
     case MSG_DATA:   handleData(msg, rssi_dbm);   break;
@@ -311,7 +310,7 @@ void processaSerial() {
 
 // ====================== ENVIO ===================
 // Com LBT habilitado no módulo, o channel sense é feito DENTRO do E220.
-void sendMessage(MeshMessage &msg) {
+static void sendMessage(MeshMessage &msg) {
   unsigned long start = millis();
   while (digitalRead(PIN_AUX) == LOW && (millis() - start < 1000)) vTaskDelay(pdMS_TO_TICKS(2));
   if (digitalRead(PIN_AUX) == LOW) {
@@ -330,7 +329,7 @@ void sendMessage(MeshMessage &msg) {
 }
 
 // ======================= HANDLERS ======================
-void handleData(MeshMessage &msg, int rssi_dbm) {
+static void handleData(MeshMessage &msg, int rssi_dbm) {
   #if MEU_ID == BASE_ID //só base
     Serial.printf("Dado: src=%d TTL=%d rssi=%d temp=%d umid=%d\n",
                   msg.src, msg.ttl, rssi_dbm,
@@ -359,7 +358,7 @@ void handleData(MeshMessage &msg, int rssi_dbm) {
   //  sinal forte    → vizinhos do origem provavelmente já receberam (baixa prob)
   //  sinal fraco    → somos talvez o último elo confiável (alta prob)
   uint8_t fwdProb;
-  if (rssi_dbm > -70)                  fwdProb = 15;
+  if (rssi_dbm > -50)                  fwdProb = 15;
   else if (rssi_dbm > RSSI_MIN_LEARN)  fwdProb = 30;
   else                                 fwdProb = 0;
 
@@ -370,7 +369,7 @@ void handleData(MeshMessage &msg, int rssi_dbm) {
     msg.ttl--;
     msg.srcHopsToBase = hopsToBase;
     msg.checkSum = calculaCrcMsg(msg);
-    enqueueFwd(msg, millis() + random(50, 300));
+    fwdQueue.enqueue(msg, millis() + random(50, 300));
   } else {
     Serial.printf("Nao retransmitindo de %d (RSSI=%d, prob=%d)\n",
                   msg.src, rssi_dbm, fwdProb);
@@ -379,7 +378,7 @@ void handleData(MeshMessage &msg, int rssi_dbm) {
 }
 
 #if MEU_ID != BASE_ID
-void handleBeacon(MeshMessage &msg, int rssi_dbm) {
+static void handleBeacon(MeshMessage &msg, int rssi_dbm) {
   // Beacon NÃO propaga (TTL=1, só base envia). Só serve pra vizinhos diretos.
   // Nós distantes aprendem hopsToBase via pacotes de dados encaminhados.
   if (rssi_dbm >= RSSI_MIN_LEARN) {
@@ -400,7 +399,7 @@ void handleBeacon(MeshMessage &msg, int rssi_dbm) {
 // ======================= ENVIOS PERIÓDICOS ======================
 
 #if MEU_ID == BASE_ID
-void sendBeacon() {
+static void sendBeacon() {
   MeshMessage beacon;
   memset(&beacon, 0, sizeof(beacon));
   beacon.startByte     = START_BYTE;
@@ -416,7 +415,7 @@ void sendBeacon() {
 #endif
 
 #if MEU_ID != BASE_ID
-void sendDataToBase() {
+static void sendDataToBase() {
   if (hopsToBase == 255) {
     Serial.println("Sem rota, aguardando topologia convergir");
     return;
@@ -431,7 +430,7 @@ void sendDataToBase() {
   data.type          = MSG_DATA;
   float t = dht.readTemperature();
   float h = dht.readHumidity();
-  if (isnan(t) || isnan(h)) return;   // não transmite leitura inválida
+  //if (isnan(t) || isnan(h)) return;   // não transmite leitura inválida
   data.payload[0] = (uint8_t)t;
   data.payload[1] = (uint8_t)h;
   data.checkSum      = calculaCrcMsg(data);
@@ -441,10 +440,10 @@ void sendDataToBase() {
 }
 #endif
 
-uint8_t getNextMsgId() { return nextMsgId++; }
+static uint8_t getNextMsgId() { return nextMsgId++; }
 
 #if MEU_ID != BASE_ID
-void checkRoute(){
+static void checkRoute(){
   if(hopsToBase == 255) return;
 
   if(millis() - confirmRoute  > ROUTETIMEOUT){
