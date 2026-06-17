@@ -379,7 +379,6 @@ static void handleData(MeshMessage &msg, int rssi_dbm) {
 
 #if MEU_ID != BASE_ID
 static void handleBeacon(MeshMessage &msg, int rssi_dbm) {
-  // Beacon NÃO propaga (TTL=1, só base envia). Só serve pra vizinhos diretos.
   // Nós distantes aprendem hopsToBase via pacotes de dados encaminhados.
   if (rssi_dbm >= RSSI_MIN_LEARN) {
     uint8_t remoteHops = msg.srcHopsToBase;
@@ -430,7 +429,7 @@ static void sendDataToBase() {
   data.type          = MSG_DATA;
   float t = dht.readTemperature();
   float h = dht.readHumidity();
-  //if (isnan(t) || isnan(h)) return;   // não transmite leitura inválida
+  if (isnan(t) || isnan(h)) return;   // não transmite leitura inválida
   data.payload[0] = (uint8_t)t;
   data.payload[1] = (uint8_t)h;
   data.checkSum      = calculaCrcMsg(data);
