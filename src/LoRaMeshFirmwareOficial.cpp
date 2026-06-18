@@ -28,11 +28,10 @@ static DHT dht(DHTP,DHTT);
 #define RSSI_MIN_LEARN        -105
 
 // ===================== HASH CACHE DE DUPLICATAS ========================
-#define HASH_SIZE    64
-#define CACHE_TTL_MS 15000
 
 class HashCache {
 public:
+
   bool alreadySeen(uint8_t src, uint8_t msgId) {
     uint8_t idx = hashFunc(src, msgId);
     for (uint8_t i = 0; i < HASH_SIZE; i++) {
@@ -65,6 +64,10 @@ public:
   }
 
 private:
+  static constexpr unsigned long CACHE_TTL_MS = 15000; 
+  static constexpr uint8_t HASH_SIZE = 64;  
+  static_assert((HASH_SIZE & (HASH_SIZE - 1)) == 0,
+                "HASH_SIZE precisa ser potencia de 2");
   struct Slot {
     uint8_t       src;
     uint8_t       msgId;
@@ -141,7 +144,6 @@ static void          sendBeacon();
 
 class RouteState {
 public:
-  static constexpr uint8_t NO_ROUTE = 255;
 
   bool init() {
     mutex = xSemaphoreCreateMutex();
@@ -180,6 +182,7 @@ public:
   }
 
 private:
+  static constexpr uint8_t NO_ROUTE = 255;
   uint8_t           hopsToBase_ = NO_ROUTE;
   unsigned long     confirmAt_ = 0;
   SemaphoreHandle_t mutex = NULL;
@@ -188,8 +191,6 @@ private:
 static RouteState routeState;
 
 // ===================== FILA DE FWD =======================
-
-#define FWD_QUEUE_SIZE 3
 
 class FwdQueue {
 public:
@@ -226,6 +227,7 @@ public:
   }
 
 private:
+  static constexpr uint8_t FWD_QUEUE_SIZE = 3;
   struct Entry {
     MeshMessage   msg;
     unsigned long sendAt;
@@ -465,7 +467,7 @@ static void sendDataToBase() {
   data.type          = MSG_DATA;
   float t = dht.readTemperature();
   float h = dht.readHumidity();
-  if (isnan(t) || isnan(h)) return;   // não transmite leitura inválida
+  //if (isnan(t) || isnan(h)) return;   // não transmite leitura inválida
   data.payload[0] = (uint8_t)t;
   data.payload[1] = (uint8_t)h;
   data.checkSum      = calculaCrcMsg(data);

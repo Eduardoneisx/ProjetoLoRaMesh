@@ -180,7 +180,7 @@ void iniciarSheets() {
   Serial.println("[Sheets] Tasks Atual (5min) e MediasH (60min) iniciadas");
 }
 
-// Assinatura nova: 3 argumentos (sem rssi).
+
 // Só registra no acumulador local — não envia nada imediatamente.
 void enviarParaSheets(uint8_t nodeId, float temp, float hum) {
   if (nodeId == 0 || nodeId > MAX_NOS) return;
