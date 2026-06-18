@@ -116,11 +116,9 @@ static uint8_t calculaCrcMsg(MeshMessage &msg) {
 }
 
 // ===================== GLOBAIS ======================
-static uint8_t           nextMsgId      = 1;
-static unsigned long     nextBeaconTime = 0;
-static unsigned long     nextSensorTime = 0;
-static volatile uint8_t  hopsToBase     = 255;
-static volatile unsigned long confirmRoute = 0;
+static uint8_t       nextMsgId      = 1;
+static unsigned long nextBeaconTime = 0;
+static unsigned long nextSensorTime = 0;
 
 // ===================== PROTÓTIPOS ====================
 static uint8_t       calculaCrcMsg(MeshMessage &msg);
@@ -133,14 +131,68 @@ static unsigned long getJitteredInterval(unsigned long base);
 #if MEU_ID != BASE_ID
 static void          handleBeacon(MeshMessage &msg, int rssi_dbm);
 static void          sendDataToBase();
-static void          checkRoute();
 #endif
 
 #if MEU_ID == BASE_ID
 static void          sendBeacon();
 #endif
-// ===================== FILA DE FWD =======================
+// ===================== ESTADO DE ROTA =======================
 #if MEU_ID != BASE_ID
+
+class RouteState {
+public:
+  static constexpr uint8_t NO_ROUTE = 255;
+
+  bool init() {
+    mutex = xSemaphoreCreateMutex();
+    return mutex != NULL;
+  }
+
+  uint8_t hops() {
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdTRUE) return NO_ROUTE;
+    uint8_t h = hopsToBase_;
+    xSemaphoreGive(mutex);
+    return h;
+  }
+
+  bool hasRoute() { return hops() != NO_ROUTE; }
+
+  // Atualiza hops/confirm atomicamente. Retorna true se achou rota mais curta.
+  bool learn(uint8_t remoteHops) {
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    unsigned long now = millis();
+    uint8_t newHops = remoteHops + 1;
+    bool improved = false;
+
+    if (newHops < hopsToBase_) {
+      hopsToBase_ = newHops;
+      confirmAt_ = now;
+      improved = true;
+    } else if (newHops == hopsToBase_) {
+      confirmAt_ = now;
+    }
+
+    xSemaphoreGive(mutex);
+    return improved;
+  }
+
+  void checkTimeout(unsigned long timeoutMs) {
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    if (hopsToBase_ != NO_ROUTE && millis() - confirmAt_ > timeoutMs) {
+      hopsToBase_ = NO_ROUTE;
+    }
+    xSemaphoreGive(mutex);
+  }
+
+private:
+  uint8_t           hopsToBase_ = NO_ROUTE;
+  unsigned long     confirmAt_ = 0;
+  SemaphoreHandle_t mutex = NULL;
+};
+
+static RouteState routeState;
+
+// ===================== FILA DE FWD =======================
 
 #define FWD_QUEUE_SIZE 3
 
@@ -210,7 +262,7 @@ static void taskPeriodic(void* pvParams) {
         sendDataToBase();
         nextSensorTime = millis() + getJitteredInterval(SENSOR_INTERVAL_BASE);
       }
-      checkRoute();
+      routeState.checkTimeout(ROUTETIMEOUT);
       fwdQueue.process();
     #endif
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -239,11 +291,10 @@ void setup() {
   Serial.printf("No %d iniciado. Base ID: %d\n", MEU_ID, BASE_ID);
 
   #if MEU_ID == BASE_ID
-    hopsToBase = 0;
     Serial.println("Modo BASE ativado");
     nextBeaconTime = millis() + random(1000, 5000);
   #else
-    if (!fwdQueue.init()) {
+    if (!routeState.init() || !fwdQueue.init()) {
       Serial.println("FATAL: sem memoria para mutex");
       while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -338,21 +389,16 @@ static void handleData(MeshMessage &msg, int rssi_dbm) {
     enviarParaSheets(msg.src, msg.payload[0], msg.payload[1]);
     
   #else //só sensor
-  // aprende rota só se o link for confiável
   if (rssi_dbm >= RSSI_MIN_LEARN) {
-    uint8_t remoteHops = msg.srcHopsToBase;
-    if (remoteHops + 1 < hopsToBase) {
-      confirmRoute = millis(); // Condirma rota atual
-      hopsToBase = remoteHops + 1;
+    if (routeState.learn(msg.srcHopsToBase)) {
       Serial.printf("Nova distancia: %d (via %d, RSSI=%d)\n",
-                    hopsToBase, msg.src, rssi_dbm);
-    }
-    if(remoteHops + 1 == hopsToBase){
-      confirmRoute = millis();
+                    routeState.hops(), msg.src, rssi_dbm);
     }
   }
 
   if (msg.ttl == 0) return;
+
+  uint8_t localHops = routeState.hops();
 
   // Gossip ponderado por RSSI:
   //  sinal forte    → vizinhos do origem provavelmente já receberam (baixa prob)
@@ -362,12 +408,12 @@ static void handleData(MeshMessage &msg, int rssi_dbm) {
   else if (rssi_dbm > RSSI_MIN_LEARN)  fwdProb = 30;
   else                                 fwdProb = 0;
 
-  bool fwd = (msg.srcHopsToBase > hopsToBase) ||
-             (msg.srcHopsToBase == hopsToBase && random(0, 100) < fwdProb);
+  bool fwd = (msg.srcHopsToBase > localHops) ||
+             (msg.srcHopsToBase == localHops && random(0, 100) < fwdProb);
 
   if (fwd) {
     msg.ttl--;
-    msg.srcHopsToBase = hopsToBase;
+    msg.srcHopsToBase = localHops;
     msg.checkSum = calculaCrcMsg(msg);
     fwdQueue.enqueue(msg, millis() + random(50, 300));
   } else {
@@ -381,15 +427,9 @@ static void handleData(MeshMessage &msg, int rssi_dbm) {
 static void handleBeacon(MeshMessage &msg, int rssi_dbm) {
   // Nós distantes aprendem hopsToBase via pacotes de dados encaminhados.
   if (rssi_dbm >= RSSI_MIN_LEARN) {
-    uint8_t remoteHops = msg.srcHopsToBase;
-    if (remoteHops + 1 < hopsToBase) {
-      hopsToBase = remoteHops + 1;
-      confirmRoute = millis(); // Condirma rota atual
+    if (routeState.learn(msg.srcHopsToBase)) {
       Serial.printf("Nova distancia (beacon): %d (RSSI=%d)\n",
-                    hopsToBase, rssi_dbm);
-    }
-    if (remoteHops + 1 == hopsToBase) {
-    confirmRoute = millis(); 
+                    routeState.hops(), rssi_dbm);
     }
   }
 }
@@ -405,27 +445,28 @@ static void sendBeacon() {
   beacon.msgId         = getNextMsgId();
   beacon.src           = MEU_ID;
   beacon.ttl           = 1;
-  beacon.srcHopsToBase = hopsToBase;
+  beacon.srcHopsToBase = 0;
   beacon.type          = MSG_BEACON;
   beacon.checkSum      = calculaCrcMsg(beacon);
   sendMessage(beacon);
-  Serial.printf("Beacon enviado (dist=%d)\n", hopsToBase);
+  Serial.printf("Beacon enviado (dist=0)\n");
 }
 #endif
 
 #if MEU_ID != BASE_ID
 static void sendDataToBase() {
-  if (hopsToBase == 255) {
+  if (!routeState.hasRoute()) {
     Serial.println("Sem rota, aguardando topologia convergir");
     return;
   }
+  uint8_t localHops = routeState.hops();
   MeshMessage data;
   memset(&data, 0, sizeof(data));
   data.startByte     = START_BYTE;
   data.msgId         = getNextMsgId();
   data.src           = MEU_ID;
   data.ttl           = TTL_INICIAL;
-  data.srcHopsToBase = hopsToBase;
+  data.srcHopsToBase = localHops;
   data.type          = MSG_DATA;
   float t = dht.readTemperature();
   float h = dht.readHumidity();
@@ -435,18 +476,8 @@ static void sendDataToBase() {
   data.checkSum      = calculaCrcMsg(data);
   sendMessage(data);
   Serial.printf("Dado enviado (dist=%d): T=%d H=%d\n",
-                hopsToBase, data.payload[0], data.payload[1]);
+                localHops, data.payload[0], data.payload[1]);
 }
 #endif
 
 static uint8_t getNextMsgId() { return nextMsgId++; }
-
-#if MEU_ID != BASE_ID
-static void checkRoute(){
-  if(hopsToBase == 255) return;
-
-  if(millis() - confirmRoute  > ROUTETIMEOUT){
-    hopsToBase = 255;
-  }
-}
-#endif
