@@ -148,12 +148,7 @@ public:
     return mutex != NULL;
   }
 
-  uint8_t hops() {
-    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdTRUE) return NO_ROUTE;
-    uint8_t h = hopsToBase_;
-    xSemaphoreGive(mutex);
-    return h;
-  }
+  uint8_t hops() { return hopsToBase_; }
 
   bool hasRoute() { return hops() != NO_ROUTE; }
 
