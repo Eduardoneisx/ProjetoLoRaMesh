@@ -299,7 +299,7 @@ void setup() {
     Serial.printf("Primeiro envio em %lu ms\n", nextSensorTime - millis());
   #endif
 
-  // Ambas as tasks no core 1 (app_cpu). Core 0 fica livre para o stack WiFi/BT.
+  // Ambas as tasks no core 1 (app_cpu). Core 0 fica livre para o stack WiFi.
   xTaskCreatePinnedToCore(taskRX,       "taskRX",       4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(taskPeriodic, "taskPeriodic", 4096, NULL, 1, NULL, 1);
 }
