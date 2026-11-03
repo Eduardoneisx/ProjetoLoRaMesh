@@ -29,55 +29,112 @@ static DHT dht(DHTP,DHTT);
 
 // ===================== HASH CACHE DE DUPLICATAS ========================
 
+// ===================== CACHE DE DUPLICACAO =====================
+// Tabela hash de endereçamento aberto com sondagem linear.
+// Tres estados por slot:
+//   EMPTY  slot nunca utilizado -> encerra a cadeia de sondagem
+//   USED   entrada valida (pode estar expirada, e entao vira DEAD)
+//   DEAD   lapide: slot ja utilizado e liberado, nao encerra a cadeia
+// Chamada apenas pela taskRX, portanto sem necessidade de mutex.
+
 class HashCache {
 public:
-
   bool alreadySeen(uint8_t src, uint8_t msgId) {
     uint8_t idx = hashFunc(src, msgId);
     for (uint8_t i = 0; i < HASH_SIZE; i++) {
-      uint8_t probe = (idx + i) & (HASH_SIZE - 1);
-      if (!slots[probe].occupied) continue;
-      if (millis() - slots[probe].seenAt > CACHE_TTL_MS) {
-        slots[probe].occupied = false;
-        continue;
+      Slot &s = slots[(idx + i) & (HASH_SIZE - 1)];
+
+      if (s.state == EMPTY) return false;          // fim da cadeia: nao esta na tabela
+
+      if (s.state == USED) {
+        if (expired(s)) {
+          s.state = DEAD;                          // vira lapide, nao EMPTY
+        } else if (s.src == src && s.msgId == msgId) {
+          return true;
+        }
       }
-      if (slots[probe].src == src && slots[probe].msgId == msgId) return true;
+      // DEAD: segue sondando
     }
     return false;
   }
 
   void add(uint8_t src, uint8_t msgId) {
-    uint8_t idx = hashFunc(src, msgId);
+    if (nonEmpty > (HASH_SIZE * 3) / 4) compact();  // garante ao menos um EMPTY
+
+    uint8_t idx  = hashFunc(src, msgId);
+    uint8_t dest = HASH_SIZE;                       // primeiro slot reaproveitavel
+
     for (uint8_t i = 0; i < HASH_SIZE; i++) {
       uint8_t probe = (idx + i) & (HASH_SIZE - 1);
-      if (!slots[probe].occupied || millis() - slots[probe].seenAt > CACHE_TTL_MS) {
-        slots[probe] = { src, msgId, true, millis() };
-        return;
+      Slot &s = slots[probe];
+
+      if (s.state == USED && expired(s)) s.state = DEAD;
+
+      if (s.state == DEAD) {
+        if (dest == HASH_SIZE) dest = probe;
+        continue;
       }
-      if (slots[probe].src == src && slots[probe].msgId == msgId) {
-        slots[probe].seenAt = millis();
+      if (s.state == EMPTY) {
+        if (dest == HASH_SIZE) { dest = probe; nonEmpty++; }
+        break;
+      }
+      if (s.src == src && s.msgId == msgId) {       // ja presente: renova o TTL
+        s.seenAt = millis();
         return;
       }
     }
-    memset(slots, 0, sizeof(slots));
-    slots[idx] = { src, msgId, true, millis() };
+    slots[dest] = { src, msgId, USED, millis() };
   }
 
 private:
-  static constexpr unsigned long CACHE_TTL_MS = 15000; 
-  static constexpr uint8_t HASH_SIZE = 64;  
+  static constexpr unsigned long CACHE_TTL_MS = 15000;
+  static constexpr uint8_t       HASH_SIZE    = 64;
   static_assert((HASH_SIZE & (HASH_SIZE - 1)) == 0,
                 "HASH_SIZE precisa ser potencia de 2");
+
+  enum State : uint8_t { EMPTY = 0, USED = 1, DEAD = 2 };
+
   struct Slot {
     uint8_t       src;
     uint8_t       msgId;
-    bool          occupied;
+    State         state;
     unsigned long seenAt;
   };
-  Slot    slots[HASH_SIZE];
 
-  uint8_t hashFunc(uint8_t src, uint8_t msgId) {
+  Slot    slots[HASH_SIZE] = {};   // EMPTY = 0
+  uint8_t nonEmpty         = 0;    // USED + DEAD
+
+  static bool expired(const Slot &s) {
+    return millis() - s.seenAt > CACHE_TTL_MS;
+  }
+
+  uint8_t hashFunc(uint8_t src, uint8_t msgId) const {
     return (src * 31 + msgId) & (HASH_SIZE - 1);
+  }
+
+  // Reconstroi a tabela apenas com entradas vivas, eliminando as lapides.
+  // Usa ~512 B de pilha; a taskRX precisa ter folga para isso.
+  void compact() {
+    Slot    live[HASH_SIZE];
+    uint8_t n = 0;
+
+    for (uint8_t i = 0; i < HASH_SIZE; i++)
+      if (slots[i].state == USED && !expired(slots[i])) live[n++] = slots[i];
+
+    memset(slots, 0, sizeof(slots));   // tudo volta a EMPTY
+    nonEmpty = 0;
+
+    for (uint8_t k = 0; k < n; k++) {
+      uint8_t idx = hashFunc(live[k].src, live[k].msgId);
+      for (uint8_t i = 0; i < HASH_SIZE; i++) {
+        uint8_t probe = (idx + i) & (HASH_SIZE - 1);
+        if (slots[probe].state == EMPTY) {
+          slots[probe] = live[k];
+          nonEmpty++;
+          break;
+        }
+      }
+    }
   }
 };
 
@@ -299,7 +356,7 @@ void setup() {
     Serial.printf("Primeiro envio em %lu ms\n", nextSensorTime - millis());
   #endif
 
-  // Ambas as tasks no core 1 (app_cpu). Core 0 fica livre para o stack WiFi.
+  // Ambas as tasks no core 1 (app_cpu). Core 0 fica livre para o stack WiFi/BT.
   xTaskCreatePinnedToCore(taskRX,       "taskRX",       4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(taskPeriodic, "taskPeriodic", 4096, NULL, 1, NULL, 1);
 }

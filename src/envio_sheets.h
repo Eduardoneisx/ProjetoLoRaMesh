@@ -4,7 +4,6 @@
 #define ENVIO_SHEETS_H
 
 #include <Arduino.h>
-#include "config.h"
 
 #if MEU_ID == BASE_ID
 void conectarWiFi();
