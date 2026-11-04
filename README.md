@@ -1,9 +1,14 @@
-[README.md](https://github.com/user-attachments/files/34336989/README.md)
-# ProjetoLoRaMesh
+[README.md](https://github.com/user-attachments/files/34391786/README.1.md)
+# LoRaMeshFirm
 
 Firmware de uma rede mesh LoRa para monitoramento de temperatura e umidade em ambientes com obstrução severa, desenvolvida no LabTermo (UFSC) em um projeto de iniciação científica orientado pelo Prof. Saulo Güths.
 
-O projeto nasceu da necessidade de monitorar um museu com paredes espessas, onde a topologia em estrela do LoRaWAN deixa áreas sem cobertura e uma malha Wi-Fi exigiria nós demais. A solução é um protocolo multi-hop leve: os próprios nós sensores repassam as mensagens dos vizinhos até a base, sem ACK, sem tabela de rotas e com o mínimo possível de tráfego de controle. A base agrega os dados e envia para uma planilha Google, que alimenta os dashboards de acompanhamento.
+O projeto nasceu da necessidade de monitorar um museu com paredes espessas, onde a topologia em estrela do LoRaWAN deixa áreas sem cobertura e uma malha Wi-Fi exigiria nós demais. A solução é um protocolo multi-hop leve: os próprios nós sensores repassam as mensagens dos vizinhos até a base, sem ACK, sem tabela de rotas e com o mínimo possível de tráfego de controle. A base agrega os dados e envia para uma planilha Google, que alimenta os dashboards de acompanhamento, e também pode gravar cada leitura num banco PostgreSQL local para análise da rede e do ambiente.
+
+```
+nós sensores → LoRa mesh → base ESP32 ─┬→ Wi-Fi → Google Sheets → Looker Studio / Power BI
+                                       └→ USB/serial → Python → PostgreSQL → views
+```
 
 ## Resultados
 
@@ -29,7 +34,7 @@ Para grandezas de variação lenta como temperatura e umidade, uma leitura perdi
 ## Hardware
 
 - ESP32 (esp32dev)
-- Módulo LoRa EBYTE E220-900T30D em 915 MHz, com antena de +3 dBi, ligado na `Serial2` a 9600 baud
+- Módulo LoRa EBYTE E220-900T30D em 915 MHz, com antena de +3 dBi, ligado na Serial2 a 9600 baud
 - Sensor DHT22 nos nós sensores
 - PCB própria, com M0/M1 fixados em hardware no modo de operação normal e desacoplamento dimensionado para os picos de cerca de 620 mA durante a transmissão
 
@@ -44,10 +49,10 @@ O E220 opera com potência de 30 dBm, air rate de 2,4 kbps, byte de RSSI anexado
 
 | Registrador | Valor |
 |---|---|
-| REG0 | `0x62` |
-| REG1 | `0x20` |
-| REG2 | `0x32` |
-| REG3 | `0x90` |
+| REG0 | 0x62 |
+| REG1 | 0x20 |
+| REG2 | 0x32 |
+| REG3 | 0x90 |
 
 ## Como a rede funciona
 
@@ -57,14 +62,14 @@ Cada mensagem tem 12 bytes, empacotados sem padding:
 
 | Campo | Bytes | Função |
 |---|---|---|
-| `startByte` | 1 | Sempre `0xAA`, usado para ressincronizar o stream da UART |
-| `msgId` | 1 | Identificador da mensagem no nó de origem |
-| `src` | 1 | ID do nó de origem |
-| `ttl` | 1 | Saltos restantes (começa em 3) |
-| `srcHopsToBase` | 1 | Distância até a base de quem fez a última transmissão |
-| `type` | 1 | `0` = dado, `1` = beacon |
-| `payload` | 5 | Temperatura e umidade (bytes 0 e 1), restante reservado |
-| `checkSum` | 1 | CRC-8 (polinômio `0x07`) |
+| startByte | 1 | Sempre 0xAA, usado para ressincronizar o stream da UART |
+| msgId | 1 | Identificador da mensagem no nó de origem |
+| src | 1 | ID do nó de origem |
+| ttl | 1 | Saltos restantes (começa em 3) |
+| srcHopsToBase | 1 | Distância até a base de quem fez a última transmissão |
+| type | 1 | 0 = dado, 1 = beacon |
+| payload | 5 | Temperatura e umidade (bytes 0 e 1), restante reservado |
+| checkSum | 1 | CRC-8 (polinômio 0x07) |
 
 Na recepção chega um 13º byte, o RSSI que o E220 adiciona ao final.
 
@@ -90,8 +95,8 @@ O air rate baixo foi escolhido porque, sob obstrução, ele decide se o enlace e
 
 Em todos os nós rodam duas tarefas no core 1:
 
-- **taskRX** sincroniza no byte de início, lê o pacote e o RSSI, valida o CRC, descarta duplicatas e despacha para o tratador de dado ou de beacon;
-- **taskPeriodic** envia os dados do sensor (nós, a cada 60 s) ou os beacons (base), verifica a expiração de rota e processa a fila de repasse.
+- `taskRX` sincroniza no byte de início, lê o pacote e o RSSI, valida o CRC, descarta duplicatas e despacha para o tratador de dado ou de beacon;
+- `taskPeriodic` envia os dados do sensor (nós, a cada 60 s) ou os beacons (base), verifica a expiração de rota e processa a fila de repasse.
 
 O estado de rota e a fila de repasse ficam encapsulados nas classes `RouteState` e `FwdQueue`, protegidas por mutex. Antes de transmitir, o firmware espera o pino AUX do E220 indicar que o módulo está livre.
 
@@ -99,20 +104,30 @@ O estado de rota e a fila de repasse ficam encapsulados nas classes `RouteState`
 
 A base acumula as leituras por nó e roda duas tarefas no core 0, junto com o Wi-Fi:
 
-- a cada **5 min** envia o valor mais recente de cada nó, marcando como offline quem não reportou nesse intervalo;
-- a cada **60 min** envia a média horária de cada nó com o número de amostras e zera os acumuladores.
+- a cada 5 min envia o valor mais recente de cada nó, marcando como offline quem não reportou nesse intervalo;
+- a cada 60 min envia a média horária de cada nó com o número de amostras e zera os acumuladores.
 
 Os envios são POSTs em JSON para um Google Apps Script, autenticados por token. Na planilha, os dados alimentam dashboards no Looker Studio e no Power BI.
+
+### Banco de dados local
+
+A planilha recebe dados agregados a cada 5 e 60 min. Para analisar a rede leitura por leitura, a base também imprime cada pacote de dados recebido na serial, numa linha como `Dado: src=2 TTL=3 rssi=-35 temp=24 umid=82`. Um script em Python lê essas linhas pela USB e grava cada uma num PostgreSQL local, sem depender de Wi-Fi nem de serviço externo.
+
+No banco, views prontas mostram a leitura mais recente de cada nó, a taxa de entrega por hora, os intervalos em que um nó ficou mais de 3 min sem comunicar e os dias em que a umidade de um local oscilou mais de 5 pontos, que é o tipo de variação que mais preocupa na conservação do acervo. O esquema, o script e as instruções estão em [`database/`](database/).
 
 ## Estrutura do repositório
 
 ```
 ProjetoLoRaMesh/
 ├── platformio.ini                  # ambientes de compilação (base e nós)
-└── src/
-    ├── LoRaMeshFirmwareOficial.cpp # protocolo mesh, tarefas e sensores
-    ├── envio_sheets.cpp/.h         # agregação e envio da base para o Google Sheets
-    └── secrets.h                   # credenciais locais (não versionado)
+├── src/
+│   ├── LoRaMeshFirmwareOficial.cpp # protocolo mesh, tarefas e sensores
+│   ├── envio_sheets.cpp/.h         # agregação e envio da base para o Google Sheets
+│   └── secrets.h                   # credenciais locais (não versionado)
+└── database/
+    ├── schema.sql                  # tabelas e views do PostgreSQL
+    ├── ingestao_serial.py          # leitura da serial da base e gravação no banco
+    └── config.example.py           # modelo da conexão (config.py não versionado)
 ```
 
 ## Como compilar
@@ -128,6 +143,8 @@ O projeto usa PlatformIO, e o papel de cada placa é definido pelas flags `MEU_I
 ```
 
 Depois é só gravar o ambiente desejado, por exemplo `pio run -e node1 -t upload`.
+
+Para usar o banco local, siga o passo a passo em [`database/README.md`](database/README.md).
 
 ## Autor
 
